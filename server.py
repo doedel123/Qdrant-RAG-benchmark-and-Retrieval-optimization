@@ -2,8 +2,8 @@
 """
 FastAPI Server fuer das juristische RAG
 ========================================
-Schlanker Produktions-Server mit API-only Retriever
-(Mixedbread Embedding + Voyage Rerank + Anthropic Expansion + Qdrant).
+Lokaler Retriever mit mxbai-de Embeddings, Ollama Query Expansion,
+lokalem Cross-Encoder-Reranking und Qdrant als Vektor-DB.
 
 Endpoints:
   GET  /health                 — Healthcheck fuer Railway/Cloud-Run
@@ -17,9 +17,10 @@ Env-Variablen (.env.local / Railway Dashboard):
   API_KEY                Schuetzt die eigenen Endpoints
   QDRANT_ENDPOINT        Qdrant Cloud URL
   QDRANT_API_KEY         Qdrant Cloud Key
-  ANTHROPIC_API_KEY      Fuer Query-Expansion (optional, empfohlen)
-  MIXEDBREAD_API_KEY     Fuer Query-Embedding
-  VOYAGE_API_KEY         Fuer Reranking
+  QUERY_EXPANSION_PROVIDER=ollama
+  OLLAMA_BASE_URL        Default: http://localhost:11434
+  OLLAMA_EXPANSION_MODEL Default: gemma4:latest
+  RERANK_PROVIDER        Default: local
   PORT                   Port (von Railway gesetzt, default 8080)
 """
 
@@ -30,7 +31,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, status
 from pydantic import BaseModel, Field
 
-from ours_mxbai_api_client import OursApiRetriever
+from ours_mxbai_client import OursMxbaiRetriever
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,14 +47,14 @@ app = FastAPI(
 )
 
 # Retriever beim App-Start initialisieren (Cold-Start-Kosten einmalig)
-RETRIEVER: Optional[OursApiRetriever] = None
+RETRIEVER: Optional[OursMxbaiRetriever] = None
 
 
 @app.on_event("startup")
 def _init_retriever():
     global RETRIEVER
     log.info("Initialisiere Retriever ...")
-    RETRIEVER = OursApiRetriever()
+    RETRIEVER = OursMxbaiRetriever()
     log.info("Retriever bereit.")
 
 
@@ -94,6 +95,16 @@ class Chunk(BaseModel):
     abschnitt: str = ""
     heading: str = ""
     source_file: str = ""
+    # Felder fuer Ermittlungsakten:
+    fall: str = ""
+    aktenzeichen: str = ""
+    dokument_typ: str = ""
+    band: str = ""
+    band_nr: Optional[int] = None
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    blatt: str = ""
+    source_id: str = ""
 
 
 class SearchResponse(BaseModel):
@@ -158,6 +169,15 @@ def search(req: SearchRequest, x_api_key: Optional[str] = Header(None)):
             abschnitt=m.get("abschnitt", ""),
             heading=m.get("heading", ""),
             source_file=m.get("source_file", ""),
+            fall=m.get("fall", ""),
+            aktenzeichen=m.get("aktenzeichen", ""),
+            dokument_typ=m.get("dokument_typ", ""),
+            band=m.get("band", ""),
+            band_nr=m.get("band_nr"),
+            page_start=m.get("page_start"),
+            page_end=m.get("page_end"),
+            blatt=m.get("blatt", ""),
+            source_id=m.get("source_id", ""),
         ))
     return SearchResponse(query=req.query, results=results, count=len(results))
 

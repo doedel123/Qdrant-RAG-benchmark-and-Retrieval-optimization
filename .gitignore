@@ -23,4 +23,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# GitNexus local index
 .gitnexus

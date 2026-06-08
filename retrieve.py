@@ -5,15 +5,15 @@ Juristisches Retrieval-Modul
 Vollstaendige RAG-Pipeline fuer juristische Texte:
 
   Nutzer-Query
-    → [Query Expansion]   Claude reformuliert → praezise juristische Query
+    → [Query Expansion]   Ollama/Gemma reformuliert → praezise juristische Query
     → [Hybrid Search]     Dense + BM25, Top 40 Kandidaten
-    → [Reranking]         Cohere Cross-Encoder, Top 40 → Top K
+    → [Reranking]         lokaler Cross-Encoder, Top 40 → Top K
     → Ergebnisse
 
 Features:
-  - Query Expansion via Claude API (juristische Praezisionsquery)
+  - Query Expansion via Ollama/Gemma lokal (Anthropic optional explizit)
   - Gewichtbare Hybrid-Suche (Dense vs. BM25 pro Source-Type)
-  - Cross-Encoder Reranking via Cohere rerank-v3.5
+  - Lokales Cross-Encoder Reranking (Cohere optional explizit)
   - Metadata-Filter (§, Gesetz, Fall, Dokumenttyp, …)
   - Multi-Collection-Suche
 
@@ -36,8 +36,11 @@ import json
 import hashlib
 import argparse
 import logging
+import sqlite3
+import time
 from dataclasses import dataclass, field
 from collections import Counter
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -65,6 +68,13 @@ try:
 except ImportError:
     HAS_COHERE = False
 
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    requests = None  # type: ignore
+    HAS_REQUESTS = False
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -79,7 +89,9 @@ ERMITTLUNGSAKTEN_COLLECTION = "ermittlungsakten"
 # Fuer Akten: Dense staerker (Alltagssprache, semantische Naehe)
 WEIGHT_PROFILES = {
     "fachliteratur": {"dense": 0.45, "bm25": 0.55},
+    "fachliteratur_mxbai": {"dense": 0.45, "bm25": 0.55},
     "ermittlungsakten": {"dense": 0.65, "bm25": 0.35},
+    "ermittlungsakten_mxbai": {"dense": 0.65, "bm25": 0.35},
     "mixed": {"dense": 0.55, "bm25": 0.45},
 }
 
@@ -87,11 +99,21 @@ DEFAULT_TOP_K = 10
 PREFETCH_MULTIPLIER = 4  # prefetch N * top_k candidates per method
 RERANK_CANDIDATES = 40   # how many candidates to send to reranker
 
-# Query Expansion
-EXPANSION_MODEL = "claude-sonnet-4-20250514"
+# Query Expansion — lokal via Ollama by default; Anthropic bleibt opt-in.
+DEFAULT_QUERY_EXPANSION_PROVIDER = "ollama"
+DEFAULT_OLLAMA_EXPANSION_MODEL = "gemma4:latest"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_EXPANSION_TIMEOUT = 60
+EXPANSION_MODEL = "claude-haiku-4-5"
 EXPANSION_MAX_TOKENS = 400
+# Disk-Cache fuer Expansionen — bei Benchmarks repetieren sich Queries,
+# jede Wiederholung wird zum Null-API-Call. None = disabled.
+EXPANSION_CACHE_PATH = Path(os.getenv(
+    "EXPANSION_CACHE_PATH", str(Path.home() / ".cache" / "rag_lw" / "expansions.sqlite3")
+))
 
-# Reranking — local cross-encoder (Cohere API als opt-in Alternative)
+# Reranking — lokaler Cross-Encoder by default; Cohere bleibt opt-in.
+DEFAULT_RERANK_PROVIDER = "local"
 LOCAL_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 COHERE_RERANK_MODEL = "rerank-v3.5"
 
@@ -174,6 +196,27 @@ class SearchResult:
     @property
     def aktenzeichen(self) -> str:
         return self.metadata.get("aktenzeichen", "")
+
+    @property
+    def band(self) -> str:
+        return self.metadata.get("band", "")
+
+    @property
+    def page_start(self) -> Optional[int]:
+        return self.metadata.get("page_start")
+
+    @property
+    def page_end(self) -> Optional[int]:
+        return self.metadata.get("page_end")
+
+    @property
+    def page_label(self) -> str:
+        ps, pe = self.page_start, self.page_end
+        if ps is None:
+            return ""
+        if pe is not None and pe != ps:
+            return f"S. {ps}–{pe}"
+        return f"S. {ps}"
 
     def short_text(self, max_len: int = 300) -> str:
         """Gekuerzter Text fuer Anzeige."""
@@ -282,7 +325,7 @@ def build_filter(
 
 
 # ---------------------------------------------------------------------------
-# Query Expansion (Claude API)
+# Query Expansion (Ollama lokal / Anthropic opt-in)
 # ---------------------------------------------------------------------------
 
 EXPANSION_SYSTEM_PROMPT = """\
@@ -303,10 +346,16 @@ Antworte AUSSCHLIESSLICH mit einem JSON-Objekt (kein Markdown, kein Codeblock):
 
 Regeln:
 - Verwende exakte juristische Terminologie (Tatbestandsmerkmale, Rechtsbegriffe)
-- Wenn ein § erkennbar ist, extrahiere ihn
+- Wenn ein § eindeutig erkennbar ist, extrahiere ihn
+- Erfinde keine Paragraphen. Wenn du unsicher bist, setze paragraph auf null
+- Die expanded_query darf nur Paragraphen enthalten, die auch im Feld paragraph stehen
 - Die expanded_query soll 1-3 Saetze lang sein
 - Fuege relevante Synonyme und verwandte Rechtsbegriffe hinzu
 - Bei Fragen zu Ermittlungsakten: behalte Sachverhaltsbezug bei
+- Wichtige Anker:
+  * Untersuchungshaft / Haftgrund / Fluchtgefahr: § 112 StPO
+  * vorlaeufige Festnahme: § 127 StPO
+  * Betrug: § 263 StGB
 """
 
 
@@ -320,40 +369,318 @@ class ExpandedQuery:
     gesetz: Optional[str] = None
 
 
-class QueryExpander:
-    """Reformuliert Nutzeranfragen via Claude API in praezise juristische Queries."""
+EXPANSION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "expanded_query": {"type": "string"},
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "paragraph": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        },
+        "gesetz": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        },
+    },
+    "required": ["expanded_query", "keywords", "paragraph", "gesetz"],
+}
 
-    def __init__(self):
+
+def _parse_json_object(text: str) -> dict:
+    """Parse JSON while tolerating markdown fences or short wrappers."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
+
+
+def _none_if_empty(value) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.strip()
+    if not value or value.lower() in {"null", "none", "-"}:
+        return None
+    return value
+
+
+def _normalize_expansion_payload(data: dict, query: str) -> dict:
+    expanded = data.get("expanded_query") or data.get("expanded") or query
+    if not isinstance(expanded, str) or not expanded.strip():
+        expanded = query
+
+    raw_keywords = data.get("keywords") or []
+    if isinstance(raw_keywords, str):
+        keywords = [raw_keywords.strip()] if raw_keywords.strip() else []
+    elif isinstance(raw_keywords, list):
+        keywords = [str(k).strip() for k in raw_keywords if str(k).strip()]
+    else:
+        keywords = []
+
+    payload = {
+        "expanded": expanded.strip(),
+        "keywords": keywords,
+        "paragraph": _none_if_empty(data.get("paragraph")),
+        "gesetz": _none_if_empty(data.get("gesetz")),
+    }
+    return _apply_known_legal_hints(payload, query)
+
+
+def _apply_known_legal_hints(payload: dict, query: str) -> dict:
+    """Correct high-confidence anchors that local LLMs tend to confuse."""
+    q = query.lower()
+    expanded = payload.get("expanded", query)
+    keywords = payload.get("keywords", [])
+
+    def ensure_keyword(value: str) -> None:
+        if value not in keywords:
+            keywords.append(value)
+
+    if any(term in q for term in ("untersuchungshaft", "u-haft", "u haft", "fluchtgefahr")):
+        payload["paragraph"] = "§ 112"
+        payload["gesetz"] = "StPO"
+        expanded = re.sub(
+            r"§\s*(?:127|129)(?:\s*Abs\.\s*\d+)?\s*StPO",
+            "§ 112 StPO",
+            expanded,
+            flags=re.IGNORECASE,
+        )
+        if "§ 112" not in expanded:
+            expanded = f"{expanded} Haftgrund Fluchtgefahr und Untersuchungshaft nach § 112 StPO."
+        ensure_keyword("§ 112 StPO")
+        ensure_keyword("Haftgrund")
+        ensure_keyword("Fluchtgefahr")
+
+    if any(term in q for term in ("betrug", "betrogen", "kunden betrogen")):
+        payload["paragraph"] = "§ 263"
+        payload["gesetz"] = "StGB"
+        if "§ 263" not in expanded:
+            expanded = f"{expanded} Betrug nach § 263 StGB."
+        ensure_keyword("§ 263 StGB")
+        ensure_keyword("Täuschung")
+        ensure_keyword("Vermögensverfügung")
+
+    payload["expanded"] = expanded.strip()
+    payload["keywords"] = keywords
+    return payload
+
+
+def _expanded_query_from_payload(query: str, payload: dict) -> ExpandedQuery:
+    return ExpandedQuery(
+        original=query,
+        expanded=payload.get("expanded", query),
+        keywords=payload.get("keywords", []),
+        paragraph=payload.get("paragraph"),
+        gesetz=payload.get("gesetz"),
+    )
+
+
+class ExpansionCache:
+    """sqlite-backed persistent cache fuer QueryExpander-Ergebnisse.
+
+    Key = (model, sha256(system_prompt) prefix, query). Schreiben/Lesen prozess-
+    sicher via sqlite's WAL. Survives across MCP server restarts und Bench-Runs.
+    """
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False ist hier safe: jede Methode oeffnet eigene
+        # Connection nicht — wir halten *eine* Connection und sqlite serialisiert
+        # Writes selbst. Reads sind concurrent.
+        self.conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS expansions (
+                model TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                query TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (model, prompt_hash, query)
+            )
+        """)
+        self.conn.commit()
+
+    def get(self, model: str, prompt_hash: str, query: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT payload FROM expansions WHERE model=? AND prompt_hash=? AND query=?",
+            (model, prompt_hash, query),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set(self, model: str, prompt_hash: str, query: str, payload: dict) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO expansions VALUES (?, ?, ?, ?, ?)",
+            (model, prompt_hash, query, json.dumps(payload), time.time()),
+        )
+        self.conn.commit()
+
+
+class OllamaQueryExpander:
+    """Lokale Query Expansion ueber Ollama, z.B. mit Gemma."""
+
+    def __init__(self, model: Optional[str] = None,
+                 base_url: Optional[str] = None,
+                 timeout: Optional[float] = None,
+                 cache_path: Optional[Path] = EXPANSION_CACHE_PATH):
+        if not HAS_REQUESTS:
+            raise RuntimeError("requests nicht installiert")
+
+        self.model = (
+            model
+            or os.getenv("OLLAMA_EXPANSION_MODEL")
+            or os.getenv("OLLAMA_MODEL")
+            or DEFAULT_OLLAMA_EXPANSION_MODEL
+        )
+        raw_base_url = base_url or os.getenv("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL
+        raw_base_url = raw_base_url.rstrip("/")
+        if raw_base_url.endswith("/api"):
+            self.url = f"{raw_base_url}/chat"
+        else:
+            self.url = f"{raw_base_url}/api/chat"
+
+        if timeout is None:
+            timeout = float(os.getenv(
+                "OLLAMA_EXPANSION_TIMEOUT",
+                str(DEFAULT_OLLAMA_EXPANSION_TIMEOUT),
+            ))
+        self.timeout = timeout
+        self._cache_model = f"ollama:{self.model}"
+        self._prompt_hash = hashlib.sha256(
+            EXPANSION_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest()[:16]
+        self.cache: Optional[ExpansionCache] = None
+        if cache_path is not None:
+            try:
+                self.cache = ExpansionCache(cache_path)
+                log.info(f"OllamaQueryExpander cache: {cache_path}")
+            except Exception as e:
+                log.warning(f"ExpansionCache disabled: {e}")
+        log.info(f"OllamaQueryExpander ({self.model}) bereit: {self.url}")
+
+    def expand(self, query: str) -> ExpandedQuery:
+        """Expandiert eine Nutzeranfrage lokal. Cache-Hit umgeht Ollama."""
+        if self.cache is not None:
+            cached = self.cache.get(self._cache_model, self._prompt_hash, query)
+            if cached is not None:
+                return _expanded_query_from_payload(query, cached)
+
+        try:
+            schema_text = json.dumps(EXPANSION_JSON_SCHEMA, ensure_ascii=False)
+            payload = {
+                "model": self.model,
+                "stream": False,
+                "think": False,
+                "format": EXPANSION_JSON_SCHEMA,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": EXPANSION_MAX_TOKENS,
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": EXPANSION_SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Nutzeranfrage: {query}\n\n"
+                            "Gib nur ein JSON-Objekt gemaess diesem Schema zurueck:\n"
+                            f"{schema_text}"
+                        ),
+                    },
+                ],
+            }
+            resp = requests.post(self.url, json=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data.get("message", {}).get("content", "").strip()
+            expansion_data = _parse_json_object(text)
+            normalized = _normalize_expansion_payload(expansion_data, query)
+            if self.cache is not None:
+                try:
+                    self.cache.set(self._cache_model, self._prompt_hash, query, normalized)
+                except Exception as e:
+                    log.warning(f"ExpansionCache write failed: {e}")
+            return _expanded_query_from_payload(query, normalized)
+        except Exception as e:
+            log.warning(f"Ollama Query Expansion fehlgeschlagen: {e} — verwende Original-Query")
+            return ExpandedQuery(original=query, expanded=query)
+
+
+class QueryExpander:
+    """Reformuliert Nutzeranfragen via Anthropic in praezise juristische Queries.
+
+    Optimierungen:
+      - Haiku 4.5: ~3x schneller und ~5x guenstiger als Sonnet 4 bei
+        vergleichbarer Qualitaet fuer Synonym-Expansion.
+      - Prompt-Caching-Marker auf dem System-Block: aktiviert sich erst
+        wenn der Prompt > 4096 Tokens wird (Haiku Minimum); aktuell nur
+        ~272 Tokens, daher kein effektiver Cache-Hit — Marker bleibt fuer
+        zukuenftiges Prompt-Wachstum bestehen.
+      - Disk-Cache (sqlite): bei wiederholten Queries (Benchmarks!) kein
+        API-Call mehr noetig. ~0ms statt ~500ms-1s pro Wiederholung.
+    """
+
+    def __init__(self, cache_path: Optional[Path] = EXPANSION_CACHE_PATH):
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY nicht gesetzt")
         self.client = anthropic.Anthropic(api_key=api_key)
-        log.info("QueryExpander (Claude) bereit.")
+        self._prompt_hash = hashlib.sha256(
+            EXPANSION_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest()[:16]
+        self.cache: Optional[ExpansionCache] = None
+        if cache_path is not None:
+            try:
+                self.cache = ExpansionCache(cache_path)
+                log.info(f"QueryExpander cache: {cache_path}")
+            except Exception as e:
+                log.warning(f"ExpansionCache disabled: {e}")
+        log.info(f"QueryExpander ({EXPANSION_MODEL}) bereit.")
 
     def expand(self, query: str) -> ExpandedQuery:
-        """Expandiert eine Nutzeranfrage."""
+        """Expandiert eine Nutzeranfrage. Cache-Hit umgeht den API-Call komplett."""
+        # 1) Cache lookup
+        if self.cache is not None:
+            cached = self.cache.get(EXPANSION_MODEL, self._prompt_hash, query)
+            if cached is not None:
+                return _expanded_query_from_payload(query, cached)
+
+        # 2) API-Call mit prompt-caching marker (aktiviert sich >4096 tok)
         try:
             response = self.client.messages.create(
                 model=EXPANSION_MODEL,
                 max_tokens=EXPANSION_MAX_TOKENS,
-                system=EXPANSION_SYSTEM_PROMPT,
+                system=[{
+                    "type": "text",
+                    "text": EXPANSION_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[{"role": "user", "content": query}],
             )
             text = response.content[0].text.strip()
 
-            # Parse JSON — handle potential markdown wrapping
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-
-            data = json.loads(text)
-            return ExpandedQuery(
-                original=query,
-                expanded=data.get("expanded_query", query),
-                keywords=data.get("keywords", []),
-                paragraph=data.get("paragraph"),
-                gesetz=data.get("gesetz"),
-            )
+            data = _parse_json_object(text)
+            payload = _normalize_expansion_payload(data, query)
+            if self.cache is not None:
+                try:
+                    self.cache.set(EXPANSION_MODEL, self._prompt_hash, query, payload)
+                except Exception as e:
+                    log.warning(f"ExpansionCache write failed: {e}")
+            return _expanded_query_from_payload(query, payload)
         except Exception as e:
             log.warning(f"Query Expansion fehlgeschlagen: {e} — verwende Original-Query")
             return ExpandedQuery(original=query, expanded=query)
@@ -366,10 +693,11 @@ class QueryExpander:
 class LocalReranker:
     """Cross-Encoder Reranking mit BAAI/bge-reranker-v2-m3 (lokal, multilingual)."""
 
-    def __init__(self):
+    def __init__(self, model_name: Optional[str] = None):
         from sentence_transformers import CrossEncoder
-        log.info(f"Lade Reranking-Modell: {LOCAL_RERANK_MODEL} ...")
-        self.model = CrossEncoder(LOCAL_RERANK_MODEL)
+        self.model_name = model_name or os.getenv("LOCAL_RERANK_MODEL") or LOCAL_RERANK_MODEL
+        log.info(f"Lade Reranking-Modell: {self.model_name} ...")
+        self.model = CrossEncoder(self.model_name, token=False)
         log.info("LocalReranker bereit.")
 
     def rerank(self, query: str, results: list["SearchResult"],
@@ -493,29 +821,77 @@ class JuristischerRetriever:
                     "und self.model manuell setzen."
                 )
             log.info("Lade Embedding-Modell ...")
-            self.model = SentenceTransformer(DENSE_MODEL_NAME)
+            self.model = SentenceTransformer(DENSE_MODEL_NAME, token=False)
 
-        # Query Expansion (optional)
-        self.expander: Optional[QueryExpander] = None
-        if enable_expansion and HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY"):
-            try:
-                self.expander = QueryExpander()
-            except Exception as e:
-                log.warning(f"Query Expansion nicht verfuegbar: {e}")
+        # Query Expansion (optional). Default: lokal via Ollama.
+        self.expander = None
+        if enable_expansion:
+            expansion_provider = (
+                os.getenv("QUERY_EXPANSION_PROVIDER")
+                or os.getenv("EXPANSION_PROVIDER")
+                or DEFAULT_QUERY_EXPANSION_PROVIDER
+            ).strip().lower()
+            if expansion_provider in {"ollama", "local"}:
+                try:
+                    self.expander = OllamaQueryExpander()
+                except Exception as e:
+                    log.warning(f"Ollama Query Expansion nicht verfuegbar: {e}")
+            elif expansion_provider in {"anthropic", "claude"}:
+                if HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY"):
+                    try:
+                        self.expander = QueryExpander()
+                    except Exception as e:
+                        log.warning(f"Anthropic Query Expansion nicht verfuegbar: {e}")
+                else:
+                    log.warning("Anthropic Query Expansion gewaehlt, aber API-Key/Paket fehlt")
+            elif expansion_provider == "auto":
+                try:
+                    self.expander = OllamaQueryExpander()
+                except Exception as e:
+                    log.info(f"Ollama Query Expansion nicht verfuegbar: {e}")
+                    if HAS_ANTHROPIC and os.getenv("ANTHROPIC_API_KEY"):
+                        try:
+                            self.expander = QueryExpander()
+                        except Exception as anthropic_error:
+                            log.warning(
+                                f"Anthropic Query Expansion nicht verfuegbar: {anthropic_error}"
+                            )
+            elif expansion_provider in {"none", "off", "false", "0"}:
+                log.info("Query Expansion deaktiviert.")
+            else:
+                log.warning(f"Unbekannter QUERY_EXPANSION_PROVIDER: {expansion_provider}")
 
-        # Reranking (optional) — try Cohere API first, fallback to local
+        # Reranking (optional). Default: lokaler Cross-Encoder.
         self.reranker = None
         if enable_reranking:
-            if HAS_COHERE and (os.getenv("COHERE_API_KEY") or os.getenv("CO_API_KEY")):
-                try:
-                    self.reranker = CohereReranker()
-                except Exception:
-                    log.info("Cohere Reranking nicht verfuegbar, nutze lokalen Cross-Encoder")
-            if self.reranker is None:
+            rerank_provider = (os.getenv("RERANK_PROVIDER") or DEFAULT_RERANK_PROVIDER).strip().lower()
+            if rerank_provider in {"local", "cross-encoder", "cross_encoder"}:
                 try:
                     self.reranker = LocalReranker()
                 except Exception as e:
-                    log.warning(f"Reranking nicht verfuegbar: {e}")
+                    log.warning(f"Lokales Reranking nicht verfuegbar: {e}")
+            elif rerank_provider == "cohere":
+                if HAS_COHERE and (os.getenv("COHERE_API_KEY") or os.getenv("CO_API_KEY")):
+                    try:
+                        self.reranker = CohereReranker()
+                    except Exception as e:
+                        log.warning(f"Cohere Reranking nicht verfuegbar: {e}")
+                else:
+                    log.warning("Cohere Reranking gewaehlt, aber API-Key/Paket fehlt")
+            elif rerank_provider == "auto":
+                try:
+                    self.reranker = LocalReranker()
+                except Exception as e:
+                    log.info(f"Lokales Reranking nicht verfuegbar: {e}")
+                    if HAS_COHERE and (os.getenv("COHERE_API_KEY") or os.getenv("CO_API_KEY")):
+                        try:
+                            self.reranker = CohereReranker()
+                        except Exception as cohere_error:
+                            log.warning(f"Cohere Reranking nicht verfuegbar: {cohere_error}")
+            elif rerank_provider in {"none", "off", "false", "0"}:
+                log.info("Reranking deaktiviert.")
+            else:
+                log.warning(f"Unbekannter RERANK_PROVIDER: {rerank_provider}")
 
         log.info("Retriever bereit.%s%s",
                  " [+Expansion]" if self.expander else "",
@@ -792,11 +1168,15 @@ def print_results(results: list[SearchResult], verbose: bool = False,
             parts = []
             if r.fall:
                 parts.append(r.fall)
+            if r.band:
+                parts.append(f"Band {r.band}")
+            if r.page_label:
+                parts.append(r.page_label)
             if r.aktenzeichen:
                 parts.append(f"Az: {r.aktenzeichen}")
-            if r.dokument_typ:
+            if r.dokument_typ and r.dokument_typ != "Sonstiges":
                 parts.append(r.dokument_typ)
-            location = " | ".join(parts) or r.collection
+            location = " · ".join(parts) or r.collection
 
         print(f"\n{src_icon} Treffer {i}  [{coll_label}]  Score: {r.score:.4f}")
         print(f"   {location}")
@@ -853,7 +1233,7 @@ def interactive_mode(retriever: JuristischerRetriever):
         if query == "/help":
             print("""
   /filter §=263 gesetz=StGB    Metadata-Filter setzen
-  /filter fall=Probenheld      Fall-Filter
+  /filter fall=donkredito      Fall-Filter
   /filter typ=Anklageschrift   Dokumenttyp-Filter
   /reset                       Alle Filter loeschen
   /coll fachliteratur          Nur in einer Collection suchen
@@ -948,7 +1328,7 @@ Beispiele:
   python retrieve.py "Hat der Angeklagte die Kunden betrogen?"
   python retrieve.py --show-expansion "Wann ist U-Haft zulässig?"
   python retrieve.py --no-expand --no-rerank "§ 263 Täuschung"
-  python retrieve.py --collection ermittlungsakten --fall Probenheld "Bestellbetrug"
+  python retrieve.py --collection ermittlungsakten --fall donkredito "Bestellbetrug"
   python retrieve.py --interactive
         """,
     )

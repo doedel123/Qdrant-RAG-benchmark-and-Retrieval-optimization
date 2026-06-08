@@ -108,7 +108,11 @@ class OursApiRetriever:
         # und tauschen nur Embedder und Reranker aus. lazy_model=True spart
         # sentence-transformers/torch in Produktions-Containern.
         from retrieve import JuristischerRetriever
-        self._retriever = JuristischerRetriever(env_file=env_file, lazy_model=True)
+        self._retriever = JuristischerRetriever(
+            env_file=env_file,
+            lazy_model=True,
+            enable_reranking=False,
+        )
         self._retriever.model = _MxbaiApiEmbedder(api_key=mxbai_key, api_base=api_base)
         self._retriever.reranker = VoyageReranker(api_key=voyage_key)
         self.collection = collection

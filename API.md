@@ -66,12 +66,12 @@ Zwei Quellen-Typen (`source_type` im Response):
 Frage (natürliche Sprache)
    │
    ▼
-[1] Query Expansion (Anthropic Claude)
+[1] Query Expansion (lokal: Ollama/Gemma)
    │   reformuliert in juristische Fachterminologie,
    │   extrahiert ggf. § / Gesetz als Filter-Hints
    ▼
 [2] Encoding
-   │   Dense:  mxbai-embed-de-large-v1 (1024-dim, über Mixedbread API)
+   │   Dense:  mixedbread-ai/deepset-mxbai-embed-de-large-v1 lokal
    │           Prompt: "Represent this sentence for searching relevant passages: <query>"
    │   Sparse: BM25-artiger TF-Vektor, IDF server-seitig in Qdrant
    ▼
@@ -83,7 +83,7 @@ Frage (natürliche Sprache)
    │            Rescoring mit Volltext-Vektoren (~0% Recall-Verlust)
    │   Optional: Pre-Filter auf `domain` (Keyword-Index)
    ▼
-[4] Reranking (Voyage rerank-2.5)
+[4] Reranking (lokaler Cross-Encoder)
    │   Cross-Encoder, sortiert die 40 Kandidaten neu
    ▼
 Top-K Chunks (default 5, max 20)
@@ -343,11 +343,11 @@ FRAGE: <user query>
 - **Kein Akten-Retrieval:** Diese API liefert nur Fachliteratur.
   Mandatsakten werden separat an den LLM-Kontext gegeben
   (bis ca. 500 k Tokens direkt, darüber eigenes Retrieval).
-- **Latenz:** 3–5 s sind normal, gelegentlich 8 s+ bei Cold-Start
-  Anthropic/Voyage. Setze Client-Timeouts auf ≥ 30 s.
+- **Latenz:** 3–5 s sind normal, gelegentlich mehr bei lokalem
+  Modell-Cold-Start. Setze Client-Timeouts auf ≥ 30 s.
 - **Rate-Limits:** Aktuell keine harten Limits im API-Server selbst;
-  upstream begrenzt Anthropic (Query Expansion) und Voyage (Rerank)
-  die Durchsatzrate. Bei Lastspitzen ggf. clientseitig batchen.
+  Qdrant Cloud kann upstream begrenzen. Lokale Modelle begrenzen die
+  Durchsatzrate ueber CPU/GPU/RAM. Bei Lastspitzen ggf. clientseitig batchen.
 - **Versionierung:** Die API hat derzeit keine explizite
   `/v1/`-Version. Breaking Changes werden in `CHANGELOG.md` angekündigt.
 
@@ -359,8 +359,9 @@ FRAGE: <user query>
 |---|---|
 | FastAPI-Server | [server.py](server.py) |
 | Retriever + Hybrid-Suche + Reranking | [retrieve.py](retrieve.py) |
-| Mixedbread-API-Embedder | [ours_mxbai_api_client.py](ours_mxbai_api_client.py) |
-| Voyage-Reranker | [voyage_reranker.py](voyage_reranker.py) |
+| Lokaler mxbai-Adapter | [ours_mxbai_client.py](ours_mxbai_client.py) |
+| Remote-API-Adapter (Benchmark/Altbetrieb) | [ours_mxbai_api_client.py](ours_mxbai_api_client.py) |
+| Voyage-Reranker (Benchmark/Altbetrieb) | [voyage_reranker.py](voyage_reranker.py) |
 | Chunker + Qdrant-Setup | [import_tool.py](import_tool.py) |
 | Fachliteratur-Import (Dispatcher) | [import_fachliteratur_mxbai.py](import_fachliteratur_mxbai.py) |
 | Dockerfile / Railway | [Dockerfile](Dockerfile), [railway.json](railway.json) |

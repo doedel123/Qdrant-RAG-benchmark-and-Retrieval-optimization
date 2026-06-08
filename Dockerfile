@@ -7,14 +7,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Nur die Server-Deps installieren (kein torch/sentence-transformers)
+# Nur die Server-Deps installieren.
 COPY requirements-server.txt .
 RUN pip install -r requirements-server.txt
 
 # Nur die tatsaechlich benoetigten Module kopieren — kein data/, keine Notebooks.
 COPY retrieve.py \
-     voyage_reranker.py \
-     ours_mxbai_api_client.py \
+     ours_mxbai_client.py \
      server.py \
      ./
 

@@ -368,13 +368,19 @@ Qdrant-Search-Call abgedeckt.
 
 ### Empfehlung
 
-**Fuer Produktion: `ours-mxbai-voyage` (mxbai-de Embedding + Voyage rerank-2.5).**
+**Historische Benchmark-Empfehlung fuer Remote-Reranking: `ours-mxbai-voyage`
+(mxbai-de Embedding + Voyage rerank-2.5).**
 
 1. **Beste Qualitaet** (nDCG 0.984, Top-1 2.89, Mean 2.69)
 2. **Gewinnt in drei von fuenf Query-Kategorien** — besonders bei komplexeren
    Konzept-, Alltagssprache- und Cross-Reference-Queries
 3. **Gleiche Latenz** wie die einfachere E5-Pipeline
 4. **Embedding lokal & kostenlos**, nur der Reranker ist ein API-Call
+
+**Fuer maximale Aktensicherheit:** der aktuelle Standardpfad nutzt
+`ours-mxbai` mit lokalem mxbai-de Embedding, lokaler Ollama Query Expansion
+und lokalem Cross-Encoder-Reranking. Nur Qdrant bleibt konfigurationsseitig
+Cloud, solange `QDRANT_ENDPOINT` auf den Cloud-Cluster zeigt.
 
 **Wichtig zur Voyage-API:** Der **Free Tier (3 RPM)** ist fuer reale Nutzung nicht brauchbar;
 ein Paid-Plan (~$0.05 pro 1k Rerank-Searches) ist noetig. Kosten bleiben minimal.
@@ -405,10 +411,10 @@ python benchmark.py --systems ours,ours-cohere,ours-mxbai,ours-mxbai-voyage --to
 
 ## Produktions-Deployment (Railway)
 
-Das RAG laeuft als schlanker FastAPI-Server, der **ausschliesslich API-Calls**
-(Mixedbread, Voyage, Anthropic, Qdrant Cloud) verwendet — kein lokales
-ML-Modell, kein torch, kein GPU. Dadurch ist das Docker-Image **<200 MB**
-und der Cold-Start kurz.
+Das RAG laeuft als FastAPI-Server mit lokalen ML-Komponenten fuer Embedding,
+Query Expansion und Reranking. Qdrant kann weiterhin Cloud bleiben; fuer einen
+vollstaendig lokalen Betrieb kann spaeter nur der Qdrant-Endpoint getauscht
+werden.
 
 ### Stack in Produktion
 
@@ -416,9 +422,9 @@ und der Cold-Start kurz.
 |---|---|
 | HTTP Server | FastAPI + Uvicorn |
 | Container | Python 3.13-slim |
-| Embedding | Mixedbread API (`mxbai-embed-de-large-v1`) |
-| Rerank | Voyage API (`rerank-2.5`) |
-| Query Expansion | Anthropic API (Claude Sonnet) |
+| Embedding | lokales `mixedbread-ai/deepset-mxbai-embed-de-large-v1` |
+| Rerank | lokaler `BAAI/bge-reranker-v2-m3` Cross-Encoder |
+| Query Expansion | Ollama lokal (`gemma4:latest` per Default) |
 | Vektor-DB | Qdrant Cloud |
 
 ### Endpoints
@@ -559,10 +565,10 @@ Qdrant Cloud
 Nutzerfrage
   |
   v
-[Query Expansion]     Claude Sonnet → juristische Praezisionsquery
+[Query Expansion]     Ollama/Gemma lokal → juristische Praezisionsquery
   |                    + automatische §/Gesetz-Erkennung
   v
-[Embedding]           E5-large (query: Prefix) + Sparse Vector
+[Embedding]           mxbai-de lokal (Query-Prompt) + Sparse Vector
   |
   v
 [Hybrid Search]       Dense + BM25 pro Collection
@@ -570,7 +576,7 @@ Nutzerfrage
   |                    Fachliteratur:  45% Dense / 55% BM25
   |                    Akten:          65% Dense / 35% BM25
   v
-[Reranking]           Cohere rerank-v3.5 (oder lokaler Cross-Encoder)
+[Reranking]           lokaler Cross-Encoder
   |                    Top 40 → Top K
   v
 Ergebnisse mit Score, Breadcrumb, Metadata
@@ -591,18 +597,21 @@ pip install -r requirements.txt
 
 ### Konfiguration
 
-API-Keys in `.env.local` eintragen:
+Konfiguration in `.env.local` eintragen:
 
 ```env
 # Pflicht
 QDRANT_ENDPOINT=https://...cloud.qdrant.io:6333
 QDRANT_API_KEY=...
 
-# Fuer Query Expansion
-ANTHROPIC_API_KEY=sk-ant-...
+# Lokale Query Expansion
+QUERY_EXPANSION_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_EXPANSION_MODEL=gemma4:latest
 
-# Fuer Reranking (Production Key empfohlen)
-COHERE_API_KEY=...
+# Lokales Reranking
+RERANK_PROVIDER=local
+LOCAL_RERANK_MODEL=BAAI/bge-reranker-v2-m3
 
 # Nur fuer Benchmark (optional)
 RAGIE_API_KEY=...
@@ -613,8 +622,8 @@ VECTARA_CORPUS_KEY=strafrecht
 VOYAGE_API_KEY=...
 ```
 
-> Ohne `ANTHROPIC_API_KEY` laeuft das System ohne Query Expansion.
-> Ohne `COHERE_API_KEY` wird automatisch ein lokaler Cross-Encoder verwendet.
+> `ANTHROPIC_API_KEY`, `COHERE_API_KEY`, `MIXEDBREAD_API_KEY` und `VOYAGE_API_KEY`
+> sind fuer den lokalen Standardpfad nicht noetig. Nur Qdrant bleibt hier Cloud.
 > Ohne `RAGIE_API_KEY` / `OPENAI_API_KEY` / `VECTARA_API_KEY` werden diese Systeme im Benchmark uebersprungen.
 
 ---
@@ -775,10 +784,10 @@ for res in results:
 
 | Stufe | Technologie | Latenz |
 |---|---|---|
-| Query Expansion | Claude Sonnet | ~3s |
-| Embedding | E5-large (lokal, MPS) | <1s |
+| Query Expansion | Ollama/Gemma lokal | modellabhaengig |
+| Embedding | mxbai-de lokal (MPS) | <1s |
 | Hybrid Search | Qdrant Cloud | ~1s |
-| Reranking | Cohere rerank-v3.5 | ~1s |
+| Reranking | lokaler Cross-Encoder | modellabhaengig |
 | **Gesamt** | | **~5s** |
 
 ---
@@ -812,7 +821,7 @@ for res in results:
 
 ```
 RAG_LW/
-  .env.local              API-Keys (Qdrant, Anthropic, Cohere, Ragie)
+  .env.local              Qdrant + lokale Provider-Konfiguration
   requirements.txt        Python-Abhaengigkeiten
   import_tool.py          Import-Pipeline (Chunking → Embedding → Qdrant)
   retrieve.py             Retrieval-Pipeline (Expansion → Search → Reranking)

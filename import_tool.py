@@ -533,12 +533,24 @@ class RatgeberChunker:
 
 class ErmittlungsaktenChunker:
     """
-    Chunking-Strategie fuer Ermittlungsakten.
+    Page-aware chunking strategy for Ermittlungsakten.
 
-    - Splittet an ## Headings (Vermerk, Anklageschrift, Zeugenaussage, …)
-    - Klassifiziert Dokumenttyp automatisch
-    - Behält Aktenzeichen und Blatt-Referenzen als Metadata
-    - Groessere Chunks (1024-1536 Tokens) um Kontext zu bewahren
+    Splits files at ## Seite N markers and groups consecutive pages into chunks
+    of ~AKTE_MAX_CHARS. Every chunk records page_start/page_end so citations
+    can reference exact page numbers — the primary anchor in investigation files.
+
+    Per-chunk metadata:
+      source_type   = "ermittlungsakte"
+      fall          = parent directory name (e.g. "donkredito")
+      aktenzeichen  = "107 Js 1286/20" — extracted from filename or content
+      band          = Roman numeral from "HA Band X" header comment ("I", "II", …)
+      band_nr       = int(1, 2, …) — derived from `band`
+      source_id     = file stem (e.g. "echte_akte1")
+      source_file   = full path
+      page_start    = first page number in this chunk
+      page_end      = last page number in this chunk
+      dokument_typ  = best-effort classifier ("Sonstiges" if no signal)
+      blatt         = best-effort "Bl. N" extraction (legacy)
     """
 
     DOC_TYPE_PATTERNS = {
@@ -557,6 +569,10 @@ class ErmittlungsaktenChunker:
     }
 
     AZ_PATTERN = re.compile(r"(\d+\s*(?:Js|KLs|Ds|Ls)\s*\d+[/_]\d+)")
+    PAGE_MARKER = re.compile(r"^## Seite (\d+)\s*$")
+    BAND_HEADER = re.compile(r"<!--\s*source:.*?Band\s+([IVXLCM]+)", re.IGNORECASE)
+    ROMAN_TO_INT = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+                    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
 
     def __init__(self, max_chars: int = AKTE_MAX_CHARS,
                  min_chars: int = AKTE_MIN_CHARS):
@@ -570,34 +586,47 @@ class ErmittlungsaktenChunker:
         path = Path(filepath)
         fall = self._extract_fall(path)
         aktenzeichen = self._extract_aktenzeichen(path, content)
+        band, band_nr = self._extract_band(content)
+        source_id = path.stem
 
-        sections = self._split_by_headings(content)
+        pages = self._split_into_pages(content)
+        if not pages:
+            return []
+
+        groups = self._group_pages(pages)
         chunks: list[Chunk] = []
 
-        for heading, body in sections:
-            doc_type = self._classify(heading, body[:500])
-            blatt = self._extract_blatt(heading + " " + body[:300])
-            full_text = f"{heading}\n{body}".strip() if heading else body.strip()
-
-            if not full_text or len(full_text) < 60:
+        for group in groups:
+            page_nums = [p["page"] for p in group]
+            page_start = page_nums[0]
+            page_end = page_nums[-1]
+            text = "\n\n".join(p["text"] for p in group).strip()
+            if not text or len(text) < 60:
                 continue
 
-            prefix = self._build_prefix(fall, aktenzeichen, doc_type)
+            doc_type = self._classify_text(text[:800])
+            blatt = self._extract_blatt(text[:500])
+            prefix = self._build_prefix(fall, aktenzeichen, band,
+                                         page_start, page_end, doc_type)
             meta = {
                 "source_type": "ermittlungsakte",
                 "source_file": str(filepath),
+                "source_id": source_id,
                 "fall": fall,
                 "aktenzeichen": aktenzeichen,
+                "band": band,
+                "band_nr": band_nr,
+                "page_start": page_start,
+                "page_end": page_end,
                 "dokument_typ": doc_type,
                 "blatt": blatt,
-                "heading": (heading or "")[:200],
             }
 
-            if len(full_text) <= self.max_chars:
-                enriched = f"[{prefix}]\n{full_text}" if prefix else full_text
+            if len(text) <= self.max_chars:
+                enriched = f"[{prefix}]\n{text}" if prefix else text
                 chunks.append(Chunk(text=enriched, metadata=meta))
             else:
-                parts = self._split_section(full_text, self.max_chars)
+                parts = self._split_section(text, self.max_chars)
                 for i, part in enumerate(parts):
                     m = {**meta, "teil": i + 1}
                     enriched = f"[{prefix}]\n{part}" if prefix else part
@@ -608,18 +637,26 @@ class ErmittlungsaktenChunker:
     # ---- helpers ----
 
     @staticmethod
-    def _build_prefix(fall: str, az: str, doc_type: str) -> str:
+    def _build_prefix(fall: str, az: str, band: str,
+                       page_start: int, page_end: int, doc_type: str) -> str:
         parts = []
         if fall:
             parts.append(f"Fall: {fall}")
         if az:
             parts.append(f"Az: {az}")
-        if doc_type:
+        if band:
+            parts.append(f"Band {band}")
+        if page_start:
+            if page_end and page_end != page_start:
+                parts.append(f"S. {page_start}–{page_end}")
+            else:
+                parts.append(f"S. {page_start}")
+        if doc_type and doc_type != "Sonstiges":
             parts.append(f"Typ: {doc_type}")
         return " | ".join(parts)
 
     def _extract_fall(self, path: Path) -> str:
-        skip = {"Probenheld-MD", "data", "ermittlungsakten", ".", ".."}
+        skip = {"data", "ermittlungsakten", ".", ".."}
         for part in reversed(path.parent.parts):
             if part in skip:
                 continue
@@ -627,25 +664,30 @@ class ErmittlungsaktenChunker:
         return path.stem
 
     def _extract_aktenzeichen(self, path: Path, content: str) -> str:
-        # From filename
         m = self.AZ_PATTERN.search(path.name)
         if m:
             return m.group(1).replace("_", "/")
-        # From directory
         for part in path.parts:
             m = self.AZ_PATTERN.search(part)
             if m:
                 return m.group(1).replace("_", "/")
-        # From content header
-        m = self.AZ_PATTERN.search(content[:1000])
+        # Scan the whole file — Az may appear deep inside (e.g., on cover sheets
+        # of Band II/III, well past the first KB of boilerplate).
+        m = self.AZ_PATTERN.search(content)
         if m:
             return m.group(1).replace("_", "/")
         return ""
 
-    def _classify(self, heading: str, text_start: str) -> str:
-        combined = f"{heading} {text_start}"
+    def _extract_band(self, content: str) -> tuple[str, int]:
+        m = self.BAND_HEADER.search(content[:500])
+        if not m:
+            return "", 0
+        roman = m.group(1).upper()
+        return roman, self.ROMAN_TO_INT.get(roman, 0)
+
+    def _classify_text(self, text_start: str) -> str:
         for doc_type, pattern in self.DOC_TYPE_PATTERNS.items():
-            if re.search(pattern, combined, re.IGNORECASE):
+            if re.search(pattern, text_start, re.IGNORECASE):
                 return doc_type
         return "Sonstiges"
 
@@ -655,29 +697,49 @@ class ErmittlungsaktenChunker:
                        text, re.IGNORECASE)
         return m.group(0) if m else ""
 
-    def _split_by_headings(self, content: str) -> list[tuple[str, str]]:
-        parts = re.split(r"^(#{1,3}\s+.+)$", content, flags=re.MULTILINE)
-        sections: list[tuple[str, str]] = []
-
-        if parts[0].strip():
-            sections.append(("", parts[0]))
-
-        for i in range(1, len(parts), 2):
-            heading = parts[i].strip()
-            body = parts[i + 1] if i + 1 < len(parts) else ""
-            sections.append((heading, body))
-
-        # Merge tiny sections into their predecessor
-        merged: list[tuple[str, str]] = []
-        for heading, body in sections:
-            full = f"{heading}\n{body}".strip()
-            if merged and len(full) < self.min_chars:
-                prev_h, prev_b = merged[-1]
-                merged[-1] = (prev_h, f"{prev_b}\n{heading}\n{body}")
+    def _split_into_pages(self, content: str) -> list[dict]:
+        """Walk lines and accumulate body per ## Seite N marker."""
+        pages: list[dict] = []
+        current_page: Optional[int] = None
+        current_buf: list[str] = []
+        for line in content.splitlines():
+            m = self.PAGE_MARKER.match(line)
+            if m:
+                if current_page is not None:
+                    pages.append({"page": current_page,
+                                  "text": "\n".join(current_buf).strip()})
+                current_page = int(m.group(1))
+                current_buf = [f"## Seite {current_page}"]
             else:
-                merged.append((heading, body))
+                current_buf.append(line)
+        if current_page is not None:
+            pages.append({"page": current_page,
+                          "text": "\n".join(current_buf).strip()})
+        return pages
 
-        return merged
+    def _group_pages(self, pages: list[dict]) -> list[list[dict]]:
+        """Greedy: pack consecutive pages until adding the next would exceed max_chars."""
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        current_size = 0
+        for page in pages:
+            size = len(page["text"]) + 2
+            if current and current_size + size > self.max_chars:
+                groups.append(current)
+                current = [page]
+                current_size = size
+            else:
+                current.append(page)
+                current_size += size
+        if current:
+            groups.append(current)
+        # Merge a trailing tiny group into its predecessor.
+        if len(groups) > 1:
+            tail_size = sum(len(p["text"]) for p in groups[-1])
+            if tail_size < self.min_chars:
+                groups[-2].extend(groups[-1])
+                groups.pop()
+        return groups
 
     @staticmethod
     def _split_section(text: str, max_chars: int) -> list[str]:
@@ -775,6 +837,7 @@ class QdrantManager:
         keyword_fields = [
             "source_type", "gesetz", "paragraph", "kommentar", "domain",
             "buch", "aktenzeichen", "fall", "dokument_typ",
+            "band", "source_id",
         ]
         for field_name in keyword_fields:
             try:
@@ -786,15 +849,16 @@ class QdrantManager:
             except Exception:
                 pass
 
-        # Integer index for randnummer
-        try:
-            self.client.create_payload_index(
-                collection_name=name,
-                field_name="randnummer",
-                field_schema=models.PayloadSchemaType.INTEGER,
-            )
-        except Exception:
-            pass
+        # Integer indexes
+        for field_name in ("randnummer", "page_start", "page_end", "band_nr"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=name,
+                    field_name=field_name,
+                    field_schema=models.PayloadSchemaType.INTEGER,
+                )
+            except Exception:
+                pass
 
         # Full-text index on text payload for keyword search fallback
         try:
